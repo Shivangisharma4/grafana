@@ -34,18 +34,21 @@ type notifierConfig struct {
 	done            <-chan struct{}
 	db              db.DB
 	dialect         sqltemplate.Dialect
+
+	pollingMaxBackoff time.Duration
 }
 
 func newNotifier(cfg *notifierConfig) (eventNotifier, error) {
 	if cfg.isHA {
 		cfg.log.Info("Using polling notifier")
 		notifier, err := newPollingNotifier(&pollingNotifierConfig{
-			pollingInterval: cfg.pollingInterval,
-			watchBufferSize: cfg.watchBufferSize,
-			log:             cfg.log,
-			bulkLock:        cfg.bulkLock,
-			listLatestRVs:   cfg.listLatestRVs,
-			storageMetrics:  cfg.storageMetrics,
+			pollingInterval:   cfg.pollingInterval,
+			pollingMaxBackoff: cfg.pollingMaxBackoff,
+			watchBufferSize:   cfg.watchBufferSize,
+			log:               cfg.log,
+			bulkLock:          cfg.bulkLock,
+			listLatestRVs:     cfg.listLatestRVs,
+			storageMetrics:    cfg.storageMetrics,
 			historyPoll: func(ctx context.Context, grp string, res string, since int64) ([]*historyPollResponse, error) {
 				var records []*historyPollResponse
 				err := cfg.db.WithTx(ctx, ReadCommittedRO, func(ctx context.Context, tx db.Tx) error {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/grafana-app-sdk/logging"
 
 	"github.com/grafana/grafana/pkg/storage/unified/resource"
@@ -38,6 +39,8 @@ type pollingNotifier struct {
 	historyPoll   func(ctx context.Context, grp string, res string, since int64) ([]*historyPollResponse, error)
 
 	done <-chan struct{}
+
+	pollingMaxBackoff time.Duration
 }
 
 type pollingNotifierConfig struct {
@@ -53,6 +56,8 @@ type pollingNotifierConfig struct {
 	historyPoll   func(ctx context.Context, grp string, res string, since int64) ([]*historyPollResponse, error)
 
 	done <-chan struct{}
+
+	pollingMaxBackoff time.Duration
 }
 
 func (cfg *pollingNotifierConfig) validate() error {
@@ -88,15 +93,16 @@ func newPollingNotifier(cfg *pollingNotifierConfig) (*pollingNotifier, error) {
 		return nil, fmt.Errorf("invalid polling notifier config: %w", err)
 	}
 	return &pollingNotifier{
-		dialect:         cfg.dialect,
-		pollingInterval: cfg.pollingInterval,
-		watchBufferSize: cfg.watchBufferSize,
-		log:             cfg.log,
-		bulkLock:        cfg.bulkLock,
-		listLatestRVs:   cfg.listLatestRVs,
-		historyPoll:     cfg.historyPoll,
-		done:            cfg.done,
-		storageMetrics:  cfg.storageMetrics,
+		dialect:           cfg.dialect,
+		pollingInterval:   cfg.pollingInterval,
+		pollingMaxBackoff: cfg.pollingMaxBackoff,
+		watchBufferSize:   cfg.watchBufferSize,
+		log:               cfg.log,
+		bulkLock:          cfg.bulkLock,
+		listLatestRVs:     cfg.listLatestRVs,
+		historyPoll:       cfg.historyPoll,
+		done:              cfg.done,
+		storageMetrics:    cfg.storageMetrics,
 	}, nil
 }
 
@@ -115,6 +121,11 @@ func (p *pollingNotifier) poller(ctx context.Context, since groupResourceRV, str
 	defer close(stream)
 	defer t.Stop()
 
+	bo := backoff.New(ctx, backoff.Config{
+		MinBackoff: p.pollingInterval,
+		MaxBackoff: p.pollingMaxBackoff,
+	})
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -127,9 +138,11 @@ func (p *pollingNotifier) poller(ctx context.Context, since groupResourceRV, str
 			grv, err := p.listLatestRVs(ctx)
 			if err != nil {
 				p.log.Error("poller get latest resource version", "err", err)
+				bo.Reset()
 				t.Reset(p.pollingInterval)
 				continue
 			}
+			hasUpdate := false
 			for group, items := range grv {
 				for resource, latestRV := range items {
 					// If we haven't seen this resource before, we start from 0.
@@ -145,11 +158,12 @@ func (p *pollingNotifier) poller(ctx context.Context, since groupResourceRV, str
 						continue
 					}
 
+					hasUpdate = true
+
 					// Poll for new events since the last known RV.
 					next, err := p.poll(ctx, group, resource, since[group][resource], stream)
 					if err != nil {
 						p.log.Error("polling for resource", "err", err)
-						t.Reset(p.pollingInterval)
 						continue
 					}
 					if next > since[group][resource] {
@@ -158,7 +172,12 @@ func (p *pollingNotifier) poller(ctx context.Context, since groupResourceRV, str
 				}
 			}
 
-			t.Reset(p.pollingInterval)
+			if hasUpdate {
+				bo.Reset()
+				t.Reset(p.pollingInterval)
+			} else {
+				t.Reset(bo.NextDelay())
+			}
 			span.End()
 		}
 	}
